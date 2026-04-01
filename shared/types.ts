@@ -8,6 +8,7 @@ export interface Peer {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  hostname: string; // machine identifier for cross-machine peer discovery
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -29,6 +30,7 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  hostname?: string;
 }
 
 export interface RegisterResponse {
@@ -45,7 +47,7 @@ export interface SetSummaryRequest {
 }
 
 export interface ListPeersRequest {
-  scope: "machine" | "directory" | "repo";
+  scope: "machine" | "directory" | "repo" | "network";
   // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;

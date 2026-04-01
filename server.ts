@@ -35,7 +35,8 @@ import {
 // --- Configuration ---
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL = process.env.CLAUDE_PEERS_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
+const IS_REMOTE_BROKER = !!process.env.CLAUDE_PEERS_URL;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
@@ -148,14 +149,14 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine and across the network can see you and send you messages.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
+- list_peers: Discover other Claude Code instances (scope: machine/directory/repo/network)
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
@@ -176,9 +177,9 @@ const TOOLS = [
       properties: {
         scope: {
           type: "string" as const,
-          enum: ["machine", "directory", "repo"],
+          enum: ["machine", "directory", "repo", "network"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository. "network" = all instances across all connected machines.',
         },
       },
       required: ["scope"],
@@ -240,7 +241,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo" | "network";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
@@ -263,6 +264,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
+            `Host: ${p.hostname}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -451,8 +453,16 @@ async function pollAndPushMessages() {
 // --- Startup ---
 
 async function main() {
-  // 1. Ensure broker is running
-  await ensureBroker();
+  // 1. Ensure broker is running (skip for remote broker)
+  if (!IS_REMOTE_BROKER) {
+    await ensureBroker();
+  } else {
+    log(`Connecting to remote broker at ${BROKER_URL}`);
+    if (!(await isBrokerAlive())) {
+      throw new Error(`Remote broker not reachable at ${BROKER_URL}`);
+    }
+    log("Remote broker is reachable");
+  }
 
   // 2. Gather context
   myCwd = process.cwd();
@@ -494,6 +504,7 @@ async function main() {
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    hostname: require("os").hostname(),
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);

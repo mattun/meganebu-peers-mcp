@@ -24,7 +24,9 @@ import type {
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const HOST = process.env.CLAUDE_PEERS_HOST ?? "127.0.0.1";
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const IS_REMOTE = HOST !== "127.0.0.1" && HOST !== "localhost";
 
 // --- Database setup ---
 
@@ -40,10 +42,18 @@ db.run(`
     git_root TEXT,
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
+    hostname TEXT NOT NULL DEFAULT 'localhost',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migration: add hostname column if upgrading from older schema
+try {
+  db.run("ALTER TABLE peers ADD COLUMN hostname TEXT NOT NULL DEFAULT 'localhost'");
+} catch {
+  // Column already exists, ignore
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -58,15 +68,32 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Clean up stale peers
+// Local peers: PID-based check (immediate, accurate)
+// Remote peers: heartbeat-based expiry (60s timeout)
+const STALE_HEARTBEAT_MS = 60_000;
+
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, hostname, last_seen FROM peers").all() as {
+    id: string; pid: number; hostname: string; last_seen: string;
+  }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    let isStale = false;
+
+    if (peer.hostname === "localhost" || peer.hostname === require("os").hostname()) {
+      // Local peer: check PID
+      try {
+        process.kill(peer.pid, 0);
+      } catch {
+        isStale = true;
+      }
+    } else {
+      // Remote peer: check heartbeat age
+      const lastSeen = new Date(peer.last_seen).getTime();
+      isStale = Date.now() - lastSeen > STALE_HEARTBEAT_MS;
+    }
+
+    if (isStale) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
@@ -81,8 +108,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, hostname, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -138,14 +165,15 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const hostname = body.hostname ?? "localhost";
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Remove any existing registration for this PID+hostname (re-registration)
+  const existing = db.query("SELECT id FROM peers WHERE pid = ? AND hostname = ?").get(body.pid, hostname) as { id: string } | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, hostname, now, now);
   return { id };
 }
 
@@ -161,6 +189,10 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   let peers: Peer[];
 
   switch (body.scope) {
+    case "network":
+      // All peers across all machines
+      peers = selectAllPeers.all() as Peer[];
+      break;
     case "machine":
       peers = selectAllPeers.all() as Peer[];
       break;
@@ -184,15 +216,23 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  const localHostname = require("os").hostname();
+
+  // Verify liveness: PID check for local, heartbeat check for remote
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
+    const isLocal = p.hostname === "localhost" || p.hostname === localHostname;
+    if (isLocal) {
+      try {
+        process.kill(p.pid, 0);
+        return true;
+      } catch {
+        deletePeer.run(p.id);
+        return false;
+      }
+    } else {
+      // Remote peer: trust heartbeat (stale cleanup handles expiry)
+      const lastSeen = new Date(p.last_seen).getTime();
+      return Date.now() - lastSeen <= STALE_HEARTBEAT_MS;
     }
   });
 }
@@ -227,7 +267,7 @@ function handleUnregister(body: { id: string }): void {
 
 Bun.serve({
   port: PORT,
-  hostname: "127.0.0.1",
+  hostname: HOST,
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -270,4 +310,4 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+console.error(`[claude-peers broker] listening on ${HOST}:${PORT} (db: ${DB_PATH})${IS_REMOTE ? " [REMOTE MODE]" : ""}`);
