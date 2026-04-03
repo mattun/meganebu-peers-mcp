@@ -29,6 +29,23 @@ const HOST = process.env.CLAUDE_PEERS_HOST ?? "127.0.0.1";
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 const IS_REMOTE = HOST !== "127.0.0.1" && HOST !== "localhost";
 
+// --- Startup guard: detect port conflict ---
+async function checkPortConflict(): Promise<void> {
+  try {
+    const res = await fetch(`http://${HOST}:${PORT}/health`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) {
+      const data = await res.json() as { status: string; peers: number };
+      console.error(`[broker] FATAL: Port ${PORT} already in use by another broker (${data.peers} peers registered).`);
+      console.error(`[broker] Find it with: lsof -i :${PORT} | grep LISTEN`);
+      console.error(`[broker] Kill it first, then restart this broker.`);
+      process.exit(1);
+    }
+  } catch {
+    // Port is free (connection refused) — good
+  }
+}
+await checkPortConflict();
+
 // --- Database setup ---
 
 const db = new Database(DB_PATH);

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-peers.broker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/bun</string>
+        <string>run</string>
+        <string>broker.ts</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/flowos/meganebu-peers-mcp</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_PEERS_HOST</key>
+        <string>0.0.0.0</string>
+        <key>CLAUDE_PEERS_PORT</key>
+        <string>7899</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-peers-broker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-peers-broker.log</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
