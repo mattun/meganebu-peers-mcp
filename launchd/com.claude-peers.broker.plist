@@ -11,7 +11,7 @@
         <string>broker.ts</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/flowos/meganebu-peers-mcp</string>
+    <string>/Users/flowos/meganebu-harness/tools/claude-peers-mcp</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>CLAUDE_PEERS_HOST</key>

@@ -2,7 +2,7 @@
 # Setup claude-peers broker as a launchd service
 #
 # Usage (on Mac mini):
-#   cd /Users/flowos/meganebu-peers-mcp
+#   cd /Users/flowos/meganebu-harness/tools/claude-peers-mcp
 #   bash launchd/setup.sh
 #
 # Management:
@@ -36,7 +36,7 @@ fi
 
 # 3. Update WorkingDirectory in plist to match current repo location
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-sed "s|/Users/flowos/meganebu-peers-mcp|$REPO_DIR|g" "$PLIST_SRC" > "$PLIST_DST"
+sed "s|/Users/flowos/meganebu-harness/tools/claude-peers-mcp|$REPO_DIR|g" "$PLIST_SRC" > "$PLIST_DST"
 echo "Installed plist: $PLIST_DST"
 echo "WorkingDirectory: $REPO_DIR"
 
