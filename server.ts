@@ -139,6 +139,13 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myWorkspaceId: string | null = process.env.CMUX_WORKSPACE_ID ?? null;
+
+// --- Local message buffer for piggyback delivery ---
+// Messages polled from broker are buffered here until delivered to Claude
+// via piggyback (appended to tool responses) or check_messages.
+const localMessageBuffer: Message[] = [];
+const localBufferIds = new Set<number>(); // O(1) dedup for repeated polls
 
 // --- MCP Server ---
 
@@ -151,19 +158,44 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine and across the network can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
-
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+IMPORTANT: Messages from other peers are delivered via "piggyback" — they appear appended to tool responses (marked with 📨). When you see a piggyback message, RESPOND IMMEDIATELY by calling send_message with the sender's from_id. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Available tools:
-- list_peers: Discover other Claude Code instances (scope: machine/directory/repo/network)
+- list_peers: Discover other Claude Code instances (scope: machine/directory/repo/network/workspace)
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Manually check for new messages
+- check_messages: Manually check for new messages (also delivered via piggyback)
+- whoami: Get your own peer ID, workspace, and context
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
 );
+
+// --- Piggyback delivery ---
+// Drain buffered messages and format as text to append to any tool response.
+// Acks drained messages with the broker.
+
+async function drainPendingMessages(): Promise<string> {
+  if (localMessageBuffer.length === 0 || !myId) return "";
+
+  const messages = localMessageBuffer.splice(0); // drain all
+  const ids = messages.map((m) => m.id);
+
+  // Remove from dedup set
+  for (const id of ids) localBufferIds.delete(id);
+
+  // Ack with broker
+  try {
+    await brokerFetch("/ack-messages", { message_ids: ids });
+  } catch (e) {
+    log(`Ack failed (messages still delivered to session): ${e}`);
+  }
+
+  const lines = messages.map(
+    (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
+  );
+  return `\n\n---\n📨 ${messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`;
+}
 
 // --- Tool definitions ---
 
@@ -177,9 +209,9 @@ const TOOLS = [
       properties: {
         scope: {
           type: "string" as const,
-          enum: ["machine", "directory", "repo", "network"],
+          enum: ["machine", "directory", "repo", "network", "workspace"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository. "network" = all instances across all connected machines.',
+            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository. "network" = all instances across all connected machines. "workspace" = same cmux workspace.',
         },
       },
       required: ["scope"],
@@ -222,7 +254,16 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+      "Manually check for new messages from other Claude Code instances. Messages are also delivered automatically via piggyback on other tool responses.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "whoami",
+    description:
+      "Returns this peer's ID, working directory, git root, and workspace ID. Useful for sharing your peer ID with others.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -241,12 +282,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   switch (name) {
     case "list_peers": {
-      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo" | "network";
+      const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo" | "network" | "workspace";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
+          workspace_id: myWorkspaceId,
           exclude_id: myId,
         });
 
@@ -268,6 +310,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
+          if (p.workspace_id) parts.push(`Workspace: ${p.workspace_id}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -275,11 +318,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           return parts.join("\n  ");
         });
 
+        const piggyback = await drainPendingMessages();
         return {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}${piggyback}`,
             },
           ],
         };
@@ -316,8 +360,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
+        const piggyback = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${piggyback}` }],
         };
       } catch (e) {
         return {
@@ -342,8 +387,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        const piggyback = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
+          content: [{ type: "text" as const, text: `Summary updated: "${summary}"${piggyback}` }],
         };
       } catch (e) {
         return {
@@ -366,20 +412,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
+        // Drain local buffer + fetch any new messages from broker
+        const freshResult = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        // Merge: local buffer + fresh (deduped)
+        const allMessages: Message[] = [...localMessageBuffer.splice(0)];
+        const seenIds = new Set(allMessages.map((m) => m.id));
+        for (const m of freshResult.messages) {
+          if (!seenIds.has(m.id)) allMessages.push(m);
+        }
+        // Clear dedup set
+        localBufferIds.clear();
+
+        if (allMessages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
+        const lines = allMessages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
         );
+        // Ack all messages
+        await brokerFetch("/ack-messages", {
+          message_ids: allMessages.map((m) => m.id),
+        });
         return {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${allMessages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -396,12 +456,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "whoami": {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `Peer ID: ${myId ?? "(not registered)"}`,
+              `CWD: ${myCwd}`,
+              `Git root: ${myGitRoot ?? "(none)"}`,
+              `Workspace: ${myWorkspaceId ?? "(none)"}`,
+              `Hostname: ${require("os").hostname()}`,
+            ].join("\n"),
+          },
+        ],
+      };
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 });
 
 // --- Polling loop for inbound messages ---
+// Poll broker and buffer messages locally. Messages are delivered to Claude via:
+// 1. Piggyback: appended to the next tool response (reliable)
+// 2. Channel notification: best-effort push (may not work)
+// Messages are only ack'd when actually delivered via piggyback or check_messages.
+
+const MAX_BUFFER_SIZE = 100; // Prevent unbounded memory growth
 
 async function pollAndPushMessages() {
   if (!myId) return;
@@ -410,42 +493,40 @@ async function pollAndPushMessages() {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
 
     for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
+      if (localBufferIds.has(msg.id)) continue; // already buffered
+
+      localBufferIds.add(msg.id);
+      localMessageBuffer.push(msg);
+      log(`Buffered message ${msg.id} from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+
+      // Best-effort channel push (may not work, but try anyway)
       try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
-
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+      } catch {
+        // Expected to fail in many environments — piggyback is the primary delivery
+      }
+    }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    // Prune old buffered messages to prevent memory leak
+    if (localMessageBuffer.length > MAX_BUFFER_SIZE) {
+      const dropped = localMessageBuffer.splice(0, localMessageBuffer.length - MAX_BUFFER_SIZE);
+      // Ack dropped messages so broker doesn't keep re-sending
+      try {
+        await brokerFetch("/ack-messages", { message_ids: dropped.map((m) => m.id) });
+      } catch { /* best effort */ }
+      for (const m of dropped) localBufferIds.delete(m.id);
+      log(`Pruned ${dropped.length} old buffered messages`);
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
@@ -497,17 +578,49 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
+  // 4. Register with broker (with retry)
+  const registrationPayload = {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
     hostname: require("os").hostname(),
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
+    workspace_id: myWorkspaceId,
+  };
+
+  const REGISTER_MAX_RETRIES = 3;
+  const REGISTER_RETRY_DELAY_MS = 2000;
+  const REGISTER_BACKGROUND_INTERVAL_MS = 30_000;
+
+  for (let attempt = 1; attempt <= REGISTER_MAX_RETRIES; attempt++) {
+    try {
+      const reg = await brokerFetch<RegisterResponse>("/register", registrationPayload);
+      myId = reg.id;
+      log(`Registered as peer ${myId}${myWorkspaceId ? ` (workspace: ${myWorkspaceId})` : ""}`);
+      break;
+    } catch (e) {
+      log(`Registration attempt ${attempt}/${REGISTER_MAX_RETRIES} failed: ${e instanceof Error ? e.message : String(e)}`);
+      if (attempt < REGISTER_MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, REGISTER_RETRY_DELAY_MS));
+      }
+    }
+  }
+
+  // If all retries failed, keep trying in the background
+  if (!myId) {
+    log("All registration attempts failed — will retry in background");
+    const bgRegister = setInterval(async () => {
+      try {
+        const reg = await brokerFetch<RegisterResponse>("/register", registrationPayload);
+        myId = reg.id;
+        log(`Background registration succeeded as peer ${myId}`);
+        clearInterval(bgRegister);
+      } catch {
+        log("Background registration retry failed");
+      }
+    }, REGISTER_BACKGROUND_INTERVAL_MS);
+  }
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -530,14 +643,32 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat (with self-healing re-registration)
+  let heartbeatCount = 0;
+  const LIVENESS_CHECK_INTERVAL = 4; // Check liveness every 4th heartbeat (~60s)
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
+    if (!myId) return;
+    try {
+      await brokerFetch("/heartbeat", { id: myId });
+      heartbeatCount++;
+
+      // Periodically verify we're still in the broker
+      if (heartbeatCount % LIVENESS_CHECK_INTERVAL === 0) {
+        const peers = await brokerFetch<Peer[]>("/list-peers", {
+          scope: "network",
+          cwd: myCwd,
+          git_root: myGitRoot,
+        });
+        const stillRegistered = peers.some((p) => p.id === myId);
+        if (!stillRegistered) {
+          log(`Peer ${myId} purged from broker, re-registering...`);
+          const reg = await brokerFetch<RegisterResponse>("/register", registrationPayload);
+          myId = reg.id;
+          log(`Re-registered as peer ${myId}`);
+        }
       }
+    } catch {
+      // Broker may be down, non-critical
     }
   }, HEARTBEAT_INTERVAL_MS);
 
