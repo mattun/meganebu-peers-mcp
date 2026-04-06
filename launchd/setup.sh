@@ -34,17 +34,36 @@ if launchctl list | grep -q "com.claude-peers.broker"; then
     launchctl unload "$PLIST_DST" 2>/dev/null || true
 fi
 
-# 3. Update WorkingDirectory in plist to match current repo location
+# 3. Resolve bun path (differs between machines: homebrew vs ~/.bun)
+BUN_PATH="$(which bun 2>/dev/null || echo "")"
+if [ -z "$BUN_PATH" ]; then
+    # Check common locations
+    for p in /opt/homebrew/bin/bun "$HOME/.bun/bin/bun" /usr/local/bin/bun; do
+        if [ -x "$p" ]; then
+            BUN_PATH="$p"
+            break
+        fi
+    done
+fi
+if [ -z "$BUN_PATH" ]; then
+    echo "❌ bun not found. Install bun first: curl -fsSL https://bun.sh/install | bash"
+    exit 1
+fi
+echo "Bun path: $BUN_PATH"
+
+# 4. Update WorkingDirectory and bun path in plist to match current environment
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-sed "s|/Users/flowos/meganebu-harness/tools/claude-peers-mcp|$REPO_DIR|g" "$PLIST_SRC" > "$PLIST_DST"
+sed -e "s|/Users/flowos/meganebu-harness/tools/claude-peers-mcp|$REPO_DIR|g" \
+    -e "s|__BUN_PATH__|$BUN_PATH|g" \
+    "$PLIST_SRC" > "$PLIST_DST"
 echo "Installed plist: $PLIST_DST"
 echo "WorkingDirectory: $REPO_DIR"
 
-# 4. Load and start
+# 5. Load and start
 launchctl load "$PLIST_DST"
 sleep 2
 
-# 5. Verify
+# 6. Verify
 if curl -s http://localhost:7899/health | grep -q "ok"; then
     echo ""
     echo "✅ Broker is running!"

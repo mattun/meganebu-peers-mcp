@@ -6,7 +6,7 @@
     <string>com.claude-peers.broker</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/bun</string>
+        <string>__BUN_PATH__</string>
         <string>run</string>
         <string>broker.ts</string>
     </array>
